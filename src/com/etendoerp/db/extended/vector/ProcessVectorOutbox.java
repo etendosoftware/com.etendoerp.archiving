@@ -46,13 +46,15 @@ public class ProcessVectorOutbox extends DalBaseProcess {
     ProcessLogger logger = bundle.getLogger();
     VectorOutboxService outbox = createOutboxService();
 
+    int retired = outbox.exhaustStaleProcessing(STALE_PROCESSING_AGE, DEFAULT_BATCH_SIZE);
     int recovered = outbox.requeueStaleProcessing(STALE_PROCESSING_AGE, DEFAULT_BATCH_SIZE);
     int processed = outbox.processPending(DEFAULT_BATCH_SIZE);
     int purged = outbox.purgeTerminal(TERMINAL_RETENTION, PURGE_BATCH_SIZE);
     OBDal.getInstance().commitAndClose();
 
     logger.logln("Vector outbox completed. Recovered stale events=" + recovered
-        + ", processed events=" + processed + ", purged events=" + purged
+        + ", retired events=" + retired + ", processed events=" + processed
+        + ", purged events=" + purged
         + ", batch size=" + DEFAULT_BATCH_SIZE + ".");
   }
 

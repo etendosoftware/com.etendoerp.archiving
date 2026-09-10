@@ -46,6 +46,15 @@ public class VectorOutboxService {
           + "AND processing.record_id = o.record_id AND processing.status = 'PROCESSING') "
           + "ORDER BY o.created, o.etarc_vector_outbox_id LIMIT ?";
 
+  /** Retry budget used when the source has no provider, matching the AD default of RETRY_LIMIT. */
+  static final int DEFAULT_RETRY_LIMIT = 3;
+  /** Resolves the retry budget of the event's source provider. Takes one parameter: the fallback. */
+  private static final String RETRY_LIMIT_SQL =
+      "COALESCE((SELECT p.retry_limit FROM etarc_vector_source s "
+          + "JOIN etarc_vector_embed_provider p "
+          + "ON p.etarc_vector_embed_provider_id = s.etarc_vector_embed_provider_id "
+          + "WHERE s.etarc_vector_source_id = etarc_vector_outbox.etarc_vector_source_id), ?)";
+
   private final ConnectionProvider connectionProvider;
   private final VectorOutboxConsumerResolver consumerResolver;
   private final Runnable transactionBoundary;
@@ -109,17 +118,62 @@ public class VectorOutboxService {
     return processed;
   }
 
-  /** Requeues failed events, allowing an administrator to choose when a retry is attempted. */
+  /**
+   * Requeues failed events, allowing an administrator to choose when a retry is attempted.
+   *
+   * <p>The attempt counter is reset: this is an explicit decision taken after correcting the
+   * provider or source configuration, so the event is entitled to a full budget again.</p>
+   */
   public int requeueFailed(int maxEvents) {
-    return requeue("FAILED", maxEvents, null);
+    return requeue("FAILED", maxEvents, null, true, false);
   }
 
-  /** Requeues events abandoned while processing for at least the supplied duration. */
+  /**
+   * Requeues events abandoned while processing for at least the supplied duration, as long as they
+   * have attempts left.
+   *
+   * <p>Recovery used to be unconditional, so an event whose delivery kills the transaction was
+   * resurrected every fifteen minutes forever. Events that exhausted their budget are retired by
+   * {@link #exhaustStaleProcessing(Duration, int)} instead.</p>
+   */
   public int requeueStaleProcessing(Duration minimumAge, int maxEvents) {
     if (minimumAge == null || minimumAge.isNegative() || minimumAge.isZero()) {
       throw new IllegalArgumentException("minimumAge must be positive");
     }
-    return requeue("PROCESSING", maxEvents, minimumAge);
+    return requeue("PROCESSING", maxEvents, minimumAge, false, true);
+  }
+
+  /**
+   * Retires abandoned events that already used every delivery attempt allowed by their provider.
+   *
+   * <p>They are marked FAILED so they leave the recovery loop and become visible to an
+   * administrator, who can correct the configuration and requeue them explicitly.</p>
+   *
+   * @return the number of events retired
+   */
+  public int exhaustStaleProcessing(Duration minimumAge, int maxEvents) {
+    if (minimumAge == null || minimumAge.isNegative() || minimumAge.isZero()) {
+      throw new IllegalArgumentException("minimumAge must be positive");
+    }
+    if (maxEvents < 1) {
+      throw new IllegalArgumentException("maxEvents must be positive");
+    }
+    String sql = "UPDATE etarc_vector_outbox SET status = 'FAILED', updated = now(), updatedby = '0', "
+        + "last_error = 'Delivery abandoned after exhausting the provider retry limit.' "
+        + "WHERE etarc_vector_outbox_id IN (SELECT etarc_vector_outbox_id FROM etarc_vector_outbox "
+        + "WHERE status = 'PROCESSING' AND updated < now() - (? * interval '1 second') "
+        + "AND attempt_count >= "
+        + RETRY_LIMIT_SQL
+        + " ORDER BY updated, etarc_vector_outbox_id LIMIT ?)";
+    try (PreparedStatement statement = connectionProvider.getPreparedStatement(sql)) {
+      statement.setLong(1, minimumAge.getSeconds());
+      statement.setInt(2, DEFAULT_RETRY_LIMIT);
+      statement.setInt(3, maxEvents);
+      return statement.executeUpdate();
+    } catch (Exception e) {
+      throw new VectorException(VectorErrorCode.VECTOR_OUTBOX_OPERATION_FAILED,
+          "Could not retire exhausted vector outbox events.", e);
+    }
   }
 
   private List<VectorOutboxEvent> loadPending(int maxEvents) {
@@ -216,20 +270,26 @@ public class VectorOutboxService {
     }
   }
 
-  private int requeue(String status, int maxEvents, Duration minimumAge) {
+  private int requeue(String status, int maxEvents, Duration minimumAge, boolean resetAttempts,
+      boolean withinAttemptLimit) {
     if (maxEvents < 1) {
       throw new IllegalArgumentException("maxEvents must be positive");
     }
     String ageCondition = minimumAge == null ? "" : " AND updated < now() - (? * interval '1 second')";
+    String attemptReset = resetAttempts ? ", attempt_count = 0" : "";
+    String attemptCondition = withinAttemptLimit ? " AND attempt_count < " + RETRY_LIMIT_SQL : "";
     String sql = "UPDATE etarc_vector_outbox SET status = 'PENDING', last_error = NULL, updated = now(), "
-        + "updatedby = '0' WHERE etarc_vector_outbox_id IN (SELECT etarc_vector_outbox_id "
-        + "FROM etarc_vector_outbox WHERE status = ?" + ageCondition
+        + "updatedby = '0'" + attemptReset + " WHERE etarc_vector_outbox_id IN (SELECT etarc_vector_outbox_id "
+        + "FROM etarc_vector_outbox WHERE status = ?" + ageCondition + attemptCondition
         + " ORDER BY updated, etarc_vector_outbox_id LIMIT ?)";
     try (PreparedStatement statement = connectionProvider.getPreparedStatement(sql)) {
       statement.setString(1, status);
       int parameter = 2;
       if (minimumAge != null) {
         statement.setLong(parameter++, minimumAge.getSeconds());
+      }
+      if (withinAttemptLimit) {
+        statement.setInt(parameter++, DEFAULT_RETRY_LIMIT);
       }
       statement.setInt(parameter, maxEvents);
       return statement.executeUpdate();
