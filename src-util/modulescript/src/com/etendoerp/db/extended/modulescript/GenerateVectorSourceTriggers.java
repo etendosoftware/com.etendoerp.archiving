@@ -136,7 +136,7 @@ public class GenerateVectorSourceTriggers extends PostUpdateModuleScript {
     }
     if (source.updateEnabled) {
       for (WatchedColumn column : loadWatchedColumns(connectionProvider, source.id)) {
-        String trigger = triggerName(source.id, "u_" + shortId(column.id).toLowerCase());
+        String trigger = triggerName(source.id, "u_" + columnKey(column.id));
         activeTriggers.add(trigger);
         String quotedColumn = quoteIdentifier(column.name);
         recreateTrigger(connectionProvider, trigger, source.tableName,
@@ -252,8 +252,28 @@ public class GenerateVectorSourceTriggers extends PostUpdateModuleScript {
     return "\"" + value.toLowerCase().replace("\"", "\"\"") + "\"";
   }
 
-  private static String shortId(String id) {
-    return id.substring(0, Math.min(8, id.length()));
+  /**
+   * Builds the per-column suffix of a watched-column trigger name.
+   * <p>
+   * The previous implementation took the first 8 characters of the column id, which collides
+   * systematically: entire tables share the same 8-character prefix across all their columns
+   * (AD_MODULE, for instance, has 33 columns starting with the same 8 characters). Two watched
+   * columns colliding produce the same trigger name, so the second CREATE silently replaces the
+   * first and that column stops enqueueing events, with no warning.
+   * <p>
+   * A hash keeps the name the same length -- the full 32-character id would push the trigger name
+   * to 78 characters, past PostgreSQL's 63-byte limit -- while making collisions random rather
+   * than systematic.
+   * <p>
+   * <b>Must stay identical to {@code CreateExcludeFilter.columnKey}</b>: the build validation
+   * derives the excluded trigger names with the same rule, and if the two drift apart DBSM stops
+   * recognising the generated triggers as excluded.
+   *
+   * @param id the AD_COLUMN_ID of the watched column
+   * @return an 8-character lowercase hexadecimal suffix
+   */
+  private static String columnKey(String id) {
+    return String.format("%08x", id.hashCode());
   }
 
   private static String quoteLiteral(String value) {
