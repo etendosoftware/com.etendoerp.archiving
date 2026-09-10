@@ -30,7 +30,7 @@ public final class OpenAiEmbeddingProvider implements VectorEmbeddingProvider {
   @Override public double[] embed(String text) {
     if (text == null || text.trim().isEmpty()) throw failed("Embedding input cannot be empty.", null);
     String key = resolveKey();
-    if (key == null || key.isEmpty()) throw failed("OpenAI API key reference is not configured: " + apiKeyReference, null);
+    if (key == null || key.isEmpty()) throw failed("The OpenAI API key is not configured. Set the system property, environment variable or Openbravo.properties entry named in the provider's API Key Reference field.", null);
     String input = text.length() > maximumInputCharacters ? text.substring(0, maximumInputCharacters) : text;
     try {
       JSONObject request = new JSONObject(); request.put("model", model); request.put("input", input);
