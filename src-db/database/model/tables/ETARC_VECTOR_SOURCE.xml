@@ -107,6 +107,10 @@
       <foreign-key foreignTable="AD_COLUMN" name="ETARC_VSRC_FILTER_COLUMN">
         <reference local="AD_FILTER_COLUMN_ID" foreign="AD_COLUMN_ID"/>
       </foreign-key>
+      <unique name="ETARC_VSRC_NAMESPACE_UQ">
+        <unique-column name="NAMESPACE"/>
+        <unique-column name="AD_CLIENT_ID"/>
+      </unique>
       <check name="ETARC_VSRC_ACTIVE_CHK"><![CDATA[ISACTIVE IN ('Y', 'N')]]></check>
       <check name="ETARC_VSRC_DELETE_CHK"><![CDATA[ISDELETEENABLED IN ('Y', 'N')]]></check>
       <check name="ETARC_VSRC_ENABLED_CHK"><![CDATA[ISENABLED IN ('Y', 'N')]]></check>

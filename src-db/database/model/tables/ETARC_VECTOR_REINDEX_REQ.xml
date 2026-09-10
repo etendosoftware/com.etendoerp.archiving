@@ -38,7 +38,7 @@
         <onCreateDefault/>
       </column>
       <column name="CONFIG_VERSION" primaryKey="false" required="true" type="DECIMAL" size="10,0" autoIncrement="false">
-        <default/>
+        <default><![CDATA[1]]></default>
         <onCreateDefault/>
       </column>
       <column name="STATUS" primaryKey="false" required="true" type="VARCHAR" size="16" autoIncrement="false">
