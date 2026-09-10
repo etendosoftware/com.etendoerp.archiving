@@ -3,30 +3,58 @@ package com.etendoerp.db.extended.vector;
 import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import org.codehaus.jettison.json.JSONObject;
 import org.openbravo.database.ConnectionProvider;
 
 /** Generic consumer that reads configured dictionary columns, with no business-entity dependency. */
 public final class DictionaryVectorOutboxConsumer implements VectorOutboxConsumer {
   private final ConnectionProvider cp; private final VectorStore store; private final VectorEmbeddingProviderFactory providers;
+  /**
+   * Per-source configuration resolved once per consumer instance.
+   *
+   * <p>Both the column mapping and the embedding provider are the same for every event of a given
+   * source, yet they were queried on each one: a batch of one hundred events issued two hundred
+   * identical queries. A consumer lives for a single run of the scheduled process, so caching here
+   * is bounded by that run.</p>
+   *
+   * <p>The source record itself is deliberately not cached: it carries the configuration version
+   * that gates stale events, and reading it fresh keeps that fence exact.</p>
+   */
+  private final Map<String, List<SourceColumn>> columnsBySource = new HashMap<>();
+  private final Map<String, VectorEmbeddingProvider> providerBySource = new HashMap<>();
   public DictionaryVectorOutboxConsumer(ConnectionProvider cp, VectorStore store) { this.cp = cp; this.store = store; providers = new VectorEmbeddingProviderFactory(cp); }
   @Override public String namespace() { return "*"; }
   @Override public boolean supports(String namespace) { return true; }
   @Override public void consume(VectorOutboxEvent event) throws Exception {
     if ("DELETE".equals(event.getEventType())) { store.delete(event.getNamespace(), event.getRecordId()); return; }
     Source source = source(event.getSourceId()); if (source.version != event.getConfigVersion()) return;
-    List<SourceColumn> columns = sourceColumns(event.getSourceId()); if (columns.stream().noneMatch(SourceColumn::isContent)) throw new VectorException(VectorErrorCode.VECTOR_INVALID_METADATA, "The vector source has no content columns.");
+    List<SourceColumn> columns = cachedColumns(event.getSourceId()); if (columns.stream().noneMatch(SourceColumn::isContent)) throw new VectorException(VectorErrorCode.VECTOR_INVALID_METADATA, "The vector source has no content columns.");
     String sql = "SELECT " + quoted(columnNames(columns)) + " FROM " + quote(source.table) + " WHERE " + quote(source.key) + " = ?";
     try (PreparedStatement statement = cp.getPreparedStatement(sql)) { statement.setString(1, event.getRecordId()); try (ResultSet result = statement.executeQuery()) {
       if (!result.next()) { store.delete(event.getNamespace(), event.getRecordId()); return; } JSONObject fields = new JSONObject(); StringBuilder text = new StringBuilder();
       for (SourceColumn column : columns) { String value = result.getString(column.name); if (value != null) { fields.put(column.name, value); if (column.isContent()) text.append(column.name).append(": ").append(value).append('\n'); } }
       JSONObject metadata = new JSONObject(); metadata.put("sourceId", event.getSourceId()); metadata.put("configVersion", event.getConfigVersion()); metadata.put("fields", fields);
-      VectorEmbeddingProvider provider = providers.forSource(event.getSourceId());
+      VectorEmbeddingProvider provider = cachedProvider(event.getSourceId());
       store.upsert(new VectorRecord(event.getNamespace(), event.getRecordId(), provider.embed(text.toString()), metadata.toString(), event.getClientId(), event.getOrganizationId()));
     } }
   }
   private Source source(String id) throws Exception { try (PreparedStatement s = cp.getPreparedStatement("SELECT s.config_version, t.tablename, k.columnname FROM etarc_vector_source s JOIN ad_table t ON t.ad_table_id=s.ad_table_id JOIN ad_column k ON k.ad_table_id=t.ad_table_id AND k.iskey='Y' AND k.isactive='Y' WHERE s.etarc_vector_source_id=?")) { s.setString(1,id); try(ResultSet r=s.executeQuery()){if(!r.next()) throw new VectorException(VectorErrorCode.VECTOR_OUTBOX_OPERATION_FAILED,"Vector source was not found."); return new Source(r.getLong(1),r.getString(2),r.getString(3));} } }
+  private List<SourceColumn> cachedColumns(String id) throws Exception {
+    List<SourceColumn> cached = columnsBySource.get(id);
+    if (cached == null) {
+      cached = sourceColumns(id);
+      columnsBySource.put(id, cached);
+    }
+    return cached;
+  }
+
+  private VectorEmbeddingProvider cachedProvider(String id) {
+    return providerBySource.computeIfAbsent(id, providers::forSource);
+  }
+
   private List<SourceColumn> sourceColumns(String id) throws Exception { List<SourceColumn> result=new ArrayList<>(); try(PreparedStatement s=cp.getPreparedStatement("SELECT c.columnname, sc.iscontent FROM etarc_vector_source_column sc JOIN ad_column c ON c.ad_column_id=sc.ad_column_id WHERE sc.etarc_vector_source_id=? AND sc.isactive='Y' ORDER BY sc.seqno")){s.setString(1,id);try(ResultSet r=s.executeQuery()){while(r.next())result.add(new SourceColumn(r.getString(1), "Y".equals(r.getString(2))));}}return result; }
   private static String columnNames(List<SourceColumn> columns) { StringBuilder result = new StringBuilder(); for(SourceColumn column:columns){if(result.length()>0)result.append(',');result.append(column.name);}return result.toString(); }
   private static String quoted(String values) { StringBuilder result=new StringBuilder(); for(String value:values.split(",")){if(result.length()>0)result.append(',');result.append(quote(value));}return result.toString(); }
