@@ -19,6 +19,7 @@ package com.etendoerp.db.extended.vector;
 import java.time.Duration;
 import java.util.Collections;
 
+import org.openbravo.dal.service.OBDal;
 import org.openbravo.scheduling.ProcessBundle;
 import org.openbravo.scheduling.ProcessLogger;
 import org.openbravo.service.db.DalBaseProcess;
@@ -52,6 +53,7 @@ public class ProcessVectorOutbox extends DalBaseProcess {
     DalConnectionProvider connectionProvider = new DalConnectionProvider(false);
     VectorStore store = new VectorStoreService(connectionProvider);
     VectorOutboxConsumer consumer = new DictionaryVectorOutboxConsumer(connectionProvider, store);
-    return new VectorOutboxService(connectionProvider, Collections.singletonList(consumer));
+    return new VectorOutboxService(connectionProvider, Collections.singletonList(consumer),
+        () -> OBDal.getInstance().commitAndClose());
   }
 }

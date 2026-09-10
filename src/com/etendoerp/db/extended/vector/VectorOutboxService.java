@@ -48,11 +48,36 @@ public class VectorOutboxService {
 
   private final ConnectionProvider connectionProvider;
   private final VectorOutboxConsumerResolver consumerResolver;
+  private final Runnable transactionBoundary;
 
+  /**
+   * Creates a service whose caller owns the transaction: no intermediate commit is issued and the
+   * whole batch lands in a single unit of work. Use
+   * {@link #VectorOutboxService(ConnectionProvider, Collection, Runnable)} whenever the consumers
+   * perform remote calls.
+   */
   public VectorOutboxService(ConnectionProvider connectionProvider,
       Collection<VectorOutboxConsumer> consumers) {
+    this(connectionProvider, consumers, () -> {
+      // No transaction boundary: the caller commits the whole batch.
+    });
+  }
+
+  /**
+   * Creates a service that closes a transaction after claiming each event and again after its
+   * terminal state is written.
+   *
+   * @param transactionBoundary
+   *     commits the work accumulated so far. It runs twice per event: once after the claim, so the
+   *     PROCESSING marker becomes visible to other nodes before the consumer starts, and once after
+   *     the event reaches DONE or FAILED, so an interrupted run does not discard the deliveries
+   *     already made.
+   */
+  public VectorOutboxService(ConnectionProvider connectionProvider,
+      Collection<VectorOutboxConsumer> consumers, Runnable transactionBoundary) {
     this.connectionProvider = connectionProvider;
     this.consumerResolver = new VectorOutboxConsumerResolver(consumers);
+    this.transactionBoundary = transactionBoundary;
   }
 
   /** Processes at most {@code maxEvents} events and returns the number successfully delivered. */
@@ -68,6 +93,10 @@ public class VectorOutboxService {
       }
       supersedeOlderPending(event);
       if (!claim(event.getId())) continue;
+      // The claim has to be durable before the consumer runs: consumers reach external providers,
+      // so holding the batch in one transaction would keep PROCESSING invisible to other nodes and
+      // would roll back every delivery already made if the run is interrupted.
+      transactionBoundary.run();
       try {
         consumer.consume(event);
         markDone(event.getId());
@@ -75,6 +104,7 @@ public class VectorOutboxService {
       } catch (Exception e) {
         markFailed(event.getId(), e);
       }
+      transactionBoundary.run();
     }
     return processed;
   }
