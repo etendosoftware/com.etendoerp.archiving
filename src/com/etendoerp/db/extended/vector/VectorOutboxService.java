@@ -175,6 +175,47 @@ public class VectorOutboxService {
     }
   }
 
+  /**
+   * Deletes events that already reached a terminal state and are older than {@code retention}.
+   *
+   * <p>The outbox is append-only: a trigger fires per watched column, so a single update of three
+   * watched columns deposits three rows, and nothing ever removed the {@code DONE} and
+   * {@code SUPERSEDED} ones. Left alone the table grows without bound and {@code loadPending}
+   * degrades with it.</p>
+   *
+   * <p>Rows are removed oldest first and in a bounded amount, so the delete never turns into a long
+   * lock. The status predicate is index-backed by both outbox indexes; filtering on {@code created}
+   * rather than {@code processed_at} keeps the ordering aligned with {@code ETARC_VOUT_PENDING_IDX}
+   * so the planner can avoid a sort, although which index it picks depends on the table's
+   * statistics.</p>
+   *
+   * @param retention
+   *     how long a terminal event is kept
+   * @param maxEvents
+   *     upper bound of rows removed in this call
+   * @return the number of events removed
+   */
+  public int purgeTerminal(Duration retention, int maxEvents) {
+    if (maxEvents < 1) {
+      throw new IllegalArgumentException("maxEvents must be positive");
+    }
+    if (retention == null || retention.isNegative()) {
+      throw new IllegalArgumentException("retention must not be negative");
+    }
+    String sql = "DELETE FROM etarc_vector_outbox WHERE etarc_vector_outbox_id IN ("
+        + "SELECT etarc_vector_outbox_id FROM etarc_vector_outbox "
+        + "WHERE status IN ('DONE', 'SUPERSEDED') AND created < now() - (? * interval '1 second') "
+        + "ORDER BY created, etarc_vector_outbox_id LIMIT ?)";
+    try (PreparedStatement statement = connectionProvider.getPreparedStatement(sql)) {
+      statement.setLong(1, retention.getSeconds());
+      statement.setInt(2, maxEvents);
+      return statement.executeUpdate();
+    } catch (Exception e) {
+      throw new VectorException(VectorErrorCode.VECTOR_OUTBOX_OPERATION_FAILED,
+          "Could not purge vector outbox events.", e);
+    }
+  }
+
   private int requeue(String status, int maxEvents, Duration minimumAge) {
     if (maxEvents < 1) {
       throw new IllegalArgumentException("maxEvents must be positive");

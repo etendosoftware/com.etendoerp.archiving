@@ -36,6 +36,10 @@ import org.openbravo.service.db.DalConnectionProvider;
 public class ProcessVectorOutbox extends DalBaseProcess {
   static final int DEFAULT_BATCH_SIZE = 100;
   static final Duration STALE_PROCESSING_AGE = Duration.ofMinutes(15);
+  /** How long a DONE or SUPERSEDED event is kept before the run removes it. */
+  static final Duration TERMINAL_RETENTION = Duration.ofDays(30);
+  /** Upper bound of events removed per run, so the delete never turns into a long lock. */
+  static final int PURGE_BATCH_SIZE = 1000;
 
   @Override
   protected void doExecute(ProcessBundle bundle) throws Exception {
@@ -44,9 +48,12 @@ public class ProcessVectorOutbox extends DalBaseProcess {
 
     int recovered = outbox.requeueStaleProcessing(STALE_PROCESSING_AGE, DEFAULT_BATCH_SIZE);
     int processed = outbox.processPending(DEFAULT_BATCH_SIZE);
+    int purged = outbox.purgeTerminal(TERMINAL_RETENTION, PURGE_BATCH_SIZE);
+    OBDal.getInstance().commitAndClose();
 
     logger.logln("Vector outbox completed. Recovered stale events=" + recovered
-        + ", processed events=" + processed + ", batch size=" + DEFAULT_BATCH_SIZE + ".");
+        + ", processed events=" + processed + ", purged events=" + purged
+        + ", batch size=" + DEFAULT_BATCH_SIZE + ".");
   }
 
   VectorOutboxService createOutboxService() {
