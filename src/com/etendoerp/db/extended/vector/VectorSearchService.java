@@ -67,12 +67,12 @@ public final class VectorSearchService {
       List<TargetMatch> matches = new ArrayList<>();
       for (VectorSearchTarget target : configuredTargets) {
         VectorSearchSource source = target.getSource();
-        for (String organizationId : context.getOrganizationIds()) {
-          VectorQuery query = new VectorQuery(source.getNamespace(), embedding, topK, source.getMetric(), "{}", target.getFilter(), context.getClientId(), organizationId);
-          for (VectorMatch match : vectorStore.search(query)) {
-            double score = scoreFor(match.getDistance(), source.getMetric());
-            if (score >= minScore && score <= maxScore) matches.add(new TargetMatch(target, match, score));
-          }
+        // Every readable organization goes into one query: iterating them issued a round trip each,
+        // and the union of their top results is the same set this returns.
+        VectorQuery query = new VectorQuery(source.getNamespace(), embedding, topK, source.getMetric(), "{}", target.getFilter(), context.getClientId(), context.getOrganizationIds());
+        for (VectorMatch match : vectorStore.search(query)) {
+          double score = scoreFor(match.getDistance(), source.getMetric());
+          if (score >= minScore && score <= maxScore) matches.add(new TargetMatch(target, match, score));
         }
       }
       matches.sort(Comparator.comparingDouble(TargetMatch::getDistance));
@@ -116,13 +116,11 @@ public final class VectorSearchService {
       double[] embedding = provider.embed(text);
       List<NamespacedMatch> matches = new ArrayList<>();
       for (VectorSearchSource source : configuredSources) {
-        for (String organizationId : context.getOrganizationIds()) {
-          for (VectorMatch match : vectorStore.search(new VectorQuery(source.getNamespace(), embedding,
-              topK, source.getMetric(), metadataFilter, context.getClientId(), organizationId))) {
-            double score = scoreFor(match.getDistance(), source.getMetric());
-            if (score >= minScore && score <= maxScore) {
-              matches.add(new NamespacedMatch(source.getNamespace(), match, score));
-            }
+        for (VectorMatch match : vectorStore.search(new VectorQuery(source.getNamespace(), embedding,
+            topK, source.getMetric(), metadataFilter, context.getClientId(), context.getOrganizationIds()))) {
+          double score = scoreFor(match.getDistance(), source.getMetric());
+          if (score >= minScore && score <= maxScore) {
+            matches.add(new NamespacedMatch(source.getNamespace(), match, score));
           }
         }
       }
