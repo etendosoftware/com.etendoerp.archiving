@@ -14,15 +14,23 @@ import org.openbravo.base.session.OBPropertiesProvider;
 /** Optional OpenAI implementation using the embeddings endpoint. */
 public final class OpenAiEmbeddingProvider implements VectorEmbeddingProvider {
   private static final String ENDPOINT = "https://api.openai.com/v1/embeddings";
-  private final String apiKeyReference, model;
+  private final String apiKeyReference, model, endpoint;
   private final int dimensions, timeoutSeconds, maximumInputCharacters;
 
+  /**
+   * @param endpoint
+   *     base URL of the embeddings API, or {@code null} to call the standard OpenAI one. It makes
+   *     the same configuration usable against an Azure OpenAI deployment, a corporate gateway or a
+   *     local stub, which is also what allows the delivery path to be exercised without a real
+   *     provider account.
+   */
   public OpenAiEmbeddingProvider(String apiKeyReference, String model, int dimensions,
-      int timeoutSeconds, int maximumInputCharacters) {
+      int timeoutSeconds, int maximumInputCharacters, String endpoint) {
     this.apiKeyReference = require(apiKeyReference, "apiKeyReference");
     this.model = require(model, "model"); this.dimensions = positive(dimensions, "dimensions");
     this.timeoutSeconds = positive(timeoutSeconds, "timeoutSeconds");
     this.maximumInputCharacters = positive(maximumInputCharacters, "maximumInputCharacters");
+    this.endpoint = endpoint == null || endpoint.trim().isEmpty() ? ENDPOINT : endpoint.trim();
   }
 
   @Override public int dimensions() { return dimensions; }
@@ -35,7 +43,7 @@ public final class OpenAiEmbeddingProvider implements VectorEmbeddingProvider {
     try {
       JSONObject request = new JSONObject(); request.put("model", model); request.put("input", input);
       request.put("dimensions", dimensions); request.put("encoding_format", "float");
-      HttpURLConnection connection = (HttpURLConnection) new URL(ENDPOINT).openConnection();
+      HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
       connection.setRequestMethod("POST"); connection.setConnectTimeout(timeoutSeconds * 1000);
       connection.setReadTimeout(timeoutSeconds * 1000); connection.setDoOutput(true);
       connection.setRequestProperty("Authorization", "Bearer " + key);
