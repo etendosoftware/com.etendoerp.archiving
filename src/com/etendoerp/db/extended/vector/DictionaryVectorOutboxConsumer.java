@@ -25,21 +25,85 @@ public final class DictionaryVectorOutboxConsumer implements VectorOutboxConsume
    */
   private final Map<String, List<SourceColumn>> columnsBySource = new HashMap<>();
   private final Map<String, VectorEmbeddingProvider> providerBySource = new HashMap<>();
+  /** Embeddings resolved by {@link #prepare(List)}, drained as each event is consumed. */
+  private final Map<String, double[]> embeddingByEvent = new HashMap<>();
   public DictionaryVectorOutboxConsumer(ConnectionProvider cp, VectorStore store) { this.cp = cp; this.store = store; providers = new VectorEmbeddingProviderFactory(cp); }
   @Override public String namespace() { return "*"; }
   @Override public boolean supports(String namespace) { return true; }
+  @Override public int batchSize(VectorOutboxEvent event) {
+    return cachedProvider(event.getSourceId()).batchSize();
+  }
+
+  /**
+   * Embeds the whole chunk in a single provider request.
+   *
+   * <p>The embedding call is the expensive part of delivery: it leaves the tenant, it is billed and
+   * it dominates the latency. Resolving it per event meant one HTTP round trip per row while the
+   * provider accepts many inputs at once. Everything else stays per event, so a row that cannot be
+   * read or upserted still fails on its own.</p>
+   */
+  @Override public void prepare(List<VectorOutboxEvent> events) throws Exception {
+    embeddingByEvent.clear();
+    List<VectorOutboxEvent> embeddable = new ArrayList<>();
+    List<String> texts = new ArrayList<>();
+    for (VectorOutboxEvent event : events) {
+      Payload payload = payload(event);
+      if (payload == null) {
+        continue;
+      }
+      embeddable.add(event);
+      texts.add(payload.text);
+    }
+    if (texts.isEmpty()) {
+      return;
+    }
+    List<double[]> vectors = cachedProvider(embeddable.get(0).getSourceId()).embed(texts);
+    for (int i = 0; i < embeddable.size(); i++) {
+      embeddingByEvent.put(embeddable.get(i).getId(), vectors.get(i));
+    }
+  }
+
   @Override public void consume(VectorOutboxEvent event) throws Exception {
     if ("DELETE".equals(event.getEventType())) { store.delete(event.getNamespace(), event.getRecordId()); return; }
-    Source source = source(event.getSourceId()); if (source.version != event.getConfigVersion()) return;
-    List<SourceColumn> columns = cachedColumns(event.getSourceId()); if (columns.stream().noneMatch(SourceColumn::isContent)) throw new VectorException(VectorErrorCode.VECTOR_INVALID_METADATA, "The vector source has no content columns.");
+    Payload payload = payload(event);
+    if (payload == null) {
+      return;
+    }
+    double[] embedding = embeddingByEvent.remove(event.getId());
+    if (embedding == null) {
+      // Not prepared, either because the dispatcher delivers one by one or because the row changed
+      // between prepare and consume. Resolving it here keeps the event deliverable either way.
+      embedding = cachedProvider(event.getSourceId()).embed(payload.text);
+    }
+    store.upsert(new VectorRecord(event.getNamespace(), event.getRecordId(), embedding,
+        payload.metadata, event.getClientId(), event.getOrganizationId()));
+  }
+
+  /**
+   * Reads the source row and builds the text to embed plus the metadata to store.
+   *
+   * @return {@code null} when the event needs no embedding, which happens when its configuration
+   *     version is stale or when the record no longer exists, in which case the vector is deleted
+   */
+  private Payload payload(VectorOutboxEvent event) throws Exception {
+    Source source = source(event.getSourceId());
+    if (source.version != event.getConfigVersion()) return null;
+    List<SourceColumn> columns = cachedColumns(event.getSourceId());
+    if (columns.stream().noneMatch(SourceColumn::isContent)) throw new VectorException(VectorErrorCode.VECTOR_INVALID_METADATA, "The vector source has no content columns.");
     String sql = "SELECT " + quoted(columnNames(columns)) + " FROM " + quote(source.table) + " WHERE " + quote(source.key) + " = ?";
     try (PreparedStatement statement = cp.getPreparedStatement(sql)) { statement.setString(1, event.getRecordId()); try (ResultSet result = statement.executeQuery()) {
-      if (!result.next()) { store.delete(event.getNamespace(), event.getRecordId()); return; } JSONObject fields = new JSONObject(); StringBuilder text = new StringBuilder();
+      if (!result.next()) { store.delete(event.getNamespace(), event.getRecordId()); return null; } JSONObject fields = new JSONObject(); StringBuilder text = new StringBuilder();
       for (SourceColumn column : columns) { String value = result.getString(column.name); if (value != null) { fields.put(column.name, value); if (column.isContent()) text.append(column.name).append(": ").append(value).append('\n'); } }
       JSONObject metadata = new JSONObject(); metadata.put("sourceId", event.getSourceId()); metadata.put("configVersion", event.getConfigVersion()); metadata.put("fields", fields);
-      VectorEmbeddingProvider provider = cachedProvider(event.getSourceId());
-      store.upsert(new VectorRecord(event.getNamespace(), event.getRecordId(), provider.embed(text.toString()), metadata.toString(), event.getClientId(), event.getOrganizationId()));
+      return new Payload(text.toString(), metadata.toString());
     } }
+  }
+
+  private static final class Payload {
+    private final String text;
+    private final String metadata;
+
+    private Payload(String text, String metadata) { this.text = text; this.metadata = metadata; }
   }
   private Source source(String id) throws Exception { try (PreparedStatement s = cp.getPreparedStatement("SELECT s.config_version, t.tablename, k.columnname FROM etarc_vector_source s JOIN ad_table t ON t.ad_table_id=s.ad_table_id JOIN ad_column k ON k.ad_table_id=t.ad_table_id AND k.iskey='Y' AND k.isactive='Y' WHERE s.etarc_vector_source_id=?")) { s.setString(1,id); try(ResultSet r=s.executeQuery()){if(!r.next()) throw new VectorException(VectorErrorCode.VECTOR_OUTBOX_OPERATION_FAILED,"Vector source was not found."); return new Source(r.getLong(1),r.getString(2),r.getString(3));} } }
   private List<SourceColumn> cachedColumns(String id) throws Exception {

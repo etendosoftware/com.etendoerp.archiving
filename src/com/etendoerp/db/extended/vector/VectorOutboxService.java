@@ -21,7 +21,9 @@ import java.sql.ResultSet;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 import org.openbravo.database.ConnectionProvider;
 
@@ -116,18 +118,71 @@ public class VectorOutboxService {
     if (maxEvents < 1) {
       throw new IllegalArgumentException("maxEvents must be positive");
     }
-    int processed = 0;
+    // Events are grouped by source so that every chunk shares one provider, and the chunk size is
+    // whatever that provider resolves in a single round trip. The chunk is also the transaction the
+    // dispatcher holds, so the two stay aligned instead of being tuned independently.
+    Map<String, List<VectorOutboxEvent>> bySource = new LinkedHashMap<>();
     for (VectorOutboxEvent event : loadPending(maxEvents)) {
-      VectorOutboxConsumer consumer = consumerResolver.resolve(event.getNamespace());
+      bySource.computeIfAbsent(event.getSourceId(), key -> new ArrayList<>()).add(event);
+    }
+    int processed = 0;
+    for (List<VectorOutboxEvent> group : bySource.values()) {
+      VectorOutboxConsumer consumer = consumerResolver.resolve(group.get(0).getNamespace());
       if (consumer == null) {
         continue;
       }
+      int chunkSize = chunkSize(consumer, group.get(0));
+      for (int start = 0; start < group.size(); start += chunkSize) {
+        processed += deliver(consumer, group.subList(start, Math.min(group.size(), start + chunkSize)));
+      }
+    }
+    return processed;
+  }
+
+  /**
+   * Asks the consumer how many events it can resolve at once, falling back to one at a time.
+   *
+   * <p>Sizing the chunk can itself fail, typically because the source has no provider configured.
+   * Delivering one by one then lets each event record that failure on its own instead of losing the
+   * whole group to an exception raised before anything was even claimed.</p>
+   */
+  private int chunkSize(VectorOutboxConsumer consumer, VectorOutboxEvent event) {
+    try {
+      return Math.max(1, consumer.batchSize(event));
+    } catch (Exception e) {
+      return 1;
+    }
+  }
+
+  /** Claims a chunk, resolves it in one go and then records the outcome of each event. */
+  private int deliver(VectorOutboxConsumer consumer, List<VectorOutboxEvent> chunk) {
+    List<VectorOutboxEvent> claimed = new ArrayList<>();
+    for (VectorOutboxEvent event : chunk) {
       supersedeOlderPending(event);
-      if (!claim(event.getId())) continue;
-      // The claim has to be durable before the consumer runs: consumers reach external providers,
-      // so holding the batch in one transaction would keep PROCESSING invisible to other nodes and
-      // would roll back every delivery already made if the run is interrupted.
+      if (claim(event.getId())) {
+        claimed.add(event);
+      }
+    }
+    // The claims have to be durable before the consumer runs: consumers reach external providers,
+    // so holding them in the same transaction would keep PROCESSING invisible to other nodes and
+    // would roll back every delivery already made if the run is interrupted.
+    transactionBoundary.commit();
+    if (claimed.isEmpty()) {
+      return 0;
+    }
+    try {
+      consumer.prepare(claimed);
+    } catch (Exception e) {
+      // What prepare resolves is shared by the chunk, so its failure is every event's failure.
+      transactionBoundary.rollback();
+      for (VectorOutboxEvent event : claimed) {
+        markFailed(event.getId(), e);
+      }
       transactionBoundary.commit();
+      return 0;
+    }
+    int processed = 0;
+    for (VectorOutboxEvent event : claimed) {
       try {
         consumer.consume(event);
         markDone(event.getId());

@@ -6,6 +6,8 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
 
 import org.codehaus.jettison.json.JSONArray;
 import org.codehaus.jettison.json.JSONObject;
@@ -15,7 +17,7 @@ import org.openbravo.base.session.OBPropertiesProvider;
 public final class OpenAiEmbeddingProvider implements VectorEmbeddingProvider {
   private static final String ENDPOINT = "https://api.openai.com/v1/embeddings";
   private final String apiKeyReference, model, endpoint;
-  private final int dimensions, timeoutSeconds, maximumInputCharacters;
+  private final int dimensions, timeoutSeconds, maximumInputCharacters, batchSize;
 
   /**
    * @param endpoint
@@ -25,23 +27,35 @@ public final class OpenAiEmbeddingProvider implements VectorEmbeddingProvider {
    *     provider account.
    */
   public OpenAiEmbeddingProvider(String apiKeyReference, String model, int dimensions,
-      int timeoutSeconds, int maximumInputCharacters, String endpoint) {
+      int timeoutSeconds, int maximumInputCharacters, String endpoint, int batchSize) {
     this.apiKeyReference = require(apiKeyReference, "apiKeyReference");
     this.model = require(model, "model"); this.dimensions = positive(dimensions, "dimensions");
     this.timeoutSeconds = positive(timeoutSeconds, "timeoutSeconds");
     this.maximumInputCharacters = positive(maximumInputCharacters, "maximumInputCharacters");
     this.endpoint = endpoint == null || endpoint.trim().isEmpty() ? ENDPOINT : endpoint.trim();
+    this.batchSize = positive(batchSize, "batchSize");
   }
+
+  @Override public int batchSize() { return batchSize; }
 
   @Override public int dimensions() { return dimensions; }
 
-  @Override public double[] embed(String text) {
-    if (text == null || text.trim().isEmpty()) throw failed("Embedding input cannot be empty.", null);
+  @Override public List<double[]> embed(List<String> texts) {
+    if (texts == null || texts.isEmpty()) throw failed("Embedding input cannot be empty.", null);
+    if (texts.size() > batchSize) {
+      throw failed("Embedding request exceeds the configured batch size of " + batchSize + ".", null);
+    }
+    for (String text : texts) {
+      if (text == null || text.trim().isEmpty()) throw failed("Embedding input cannot be empty.", null);
+    }
     String key = resolveKey();
     if (key == null || key.isEmpty()) throw failed("The OpenAI API key is not configured. Set the system property, environment variable or Openbravo.properties entry named in the provider's API Key Reference field.", null);
-    String input = text.length() > maximumInputCharacters ? text.substring(0, maximumInputCharacters) : text;
+    JSONArray inputs = new JSONArray();
+    for (String text : texts) {
+      inputs.put(text.length() > maximumInputCharacters ? text.substring(0, maximumInputCharacters) : text);
+    }
     try {
-      JSONObject request = new JSONObject(); request.put("model", model); request.put("input", input);
+      JSONObject request = new JSONObject(); request.put("model", model); request.put("input", inputs);
       request.put("dimensions", dimensions); request.put("encoding_format", "float");
       HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
       connection.setRequestMethod("POST"); connection.setConnectTimeout(timeoutSeconds * 1000);
@@ -52,10 +66,28 @@ public final class OpenAiEmbeddingProvider implements VectorEmbeddingProvider {
       int status = connection.getResponseCode();
       String body = read(status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream());
       if (status < 200 || status >= 300) throw failed("OpenAI embedding request failed with HTTP " + status + ".", null);
-      JSONArray values = new JSONObject(body).getJSONArray("data").getJSONObject(0).getJSONArray("embedding");
-      if (values.length() != dimensions) throw failed("OpenAI returned an unexpected embedding dimension.", null);
-      double[] embedding = new double[dimensions]; for (int i = 0; i < dimensions; i++) embedding[i] = values.getDouble(i);
-      return embedding;
+      JSONArray data = new JSONObject(body).getJSONArray("data");
+      if (data.length() != texts.size()) {
+        throw failed("OpenAI returned " + data.length() + " embeddings for " + texts.size() + " inputs.", null);
+      }
+      // The response carries an explicit index and is not guaranteed to preserve request order.
+      List<double[]> embeddings = new ArrayList<>(java.util.Collections.nCopies(texts.size(), null));
+      for (int entry = 0; entry < data.length(); entry++) {
+        JSONObject item = data.getJSONObject(entry);
+        int index = item.has("index") ? item.getInt("index") : entry;
+        if (index < 0 || index >= texts.size()) {
+          throw failed("OpenAI returned an embedding with an out of range index.", null);
+        }
+        JSONArray values = item.getJSONArray("embedding");
+        if (values.length() != dimensions) throw failed("OpenAI returned an unexpected embedding dimension.", null);
+        double[] embedding = new double[dimensions];
+        for (int i = 0; i < dimensions; i++) embedding[i] = values.getDouble(i);
+        embeddings.set(index, embedding);
+      }
+      for (double[] embedding : embeddings) {
+        if (embedding == null) throw failed("OpenAI did not return an embedding for every input.", null);
+      }
+      return embeddings;
     } catch (VectorException e) { throw e; } catch (Exception e) { throw failed("Could not request an OpenAI embedding.", e); }
   }
 

@@ -28,4 +28,29 @@ public interface VectorOutboxConsumer {
   default boolean supports(String candidateNamespace) { return namespace().equals(candidateNamespace); }
 
   void consume(VectorOutboxEvent event) throws Exception;
+
+  /**
+   * Number of events the dispatcher may hand to a single {@link #prepare(java.util.List)} call.
+   *
+   * <p>It bounds the delivery chunk, which is also the transaction the dispatcher holds, so it
+   * should match whatever the consumer can resolve in one remote round trip.</p>
+   *
+   * @param event
+   *     any event of the group about to be delivered, so the consumer can size the chunk from its
+   *     own per-source configuration
+   */
+  default int batchSize(VectorOutboxEvent event) {
+    return 1;
+  }
+
+  /**
+   * Resolves in one go everything the following {@link #consume(VectorOutboxEvent)} calls will
+   * need, so an expensive remote call is paid once per chunk instead of once per event.
+   *
+   * <p>Implementing it is optional: the default does nothing and each event resolves itself. A failure
+   * here fails the whole chunk, which is correct when the shared call is what failed.</p>
+   */
+  default void prepare(java.util.List<VectorOutboxEvent> events) throws Exception {
+    // Nothing to resolve ahead of time.
+  }
 }
