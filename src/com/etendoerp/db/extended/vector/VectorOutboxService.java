@@ -46,7 +46,11 @@ public class VectorOutboxService {
           + "AND newer.record_id = o.record_id AND newer.status = 'PENDING' AND (newer.created > o.created OR (newer.created = o.created AND newer.etarc_vector_outbox_id > o.etarc_vector_outbox_id))) "
           + "AND NOT EXISTS (SELECT 1 FROM etarc_vector_outbox processing WHERE processing.etarc_vector_source_id = o.etarc_vector_source_id "
           + "AND processing.record_id = o.record_id AND processing.status = 'PROCESSING') "
-          + "ORDER BY o.created, o.etarc_vector_outbox_id LIMIT ?";
+          // SKIP LOCKED keeps concurrent nodes from all fetching the same rows: without it every
+          // node but one wastes its whole batch losing the claim compare-and-swap. The locks last
+          // until the first chunk commits, after which correctness rests on that compare-and-swap
+          // and on the PROCESSING guard above, which is what actually prevents double delivery.
+          + "ORDER BY o.created, o.etarc_vector_outbox_id LIMIT ? FOR UPDATE OF o SKIP LOCKED";
 
   /** Retry budget used when the source has no provider, matching the AD default of RETRY_LIMIT. */
   static final int DEFAULT_RETRY_LIMIT = 3;
