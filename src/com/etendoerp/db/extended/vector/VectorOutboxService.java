@@ -57,7 +57,23 @@ public class VectorOutboxService {
 
   private final ConnectionProvider connectionProvider;
   private final VectorOutboxConsumerResolver consumerResolver;
-  private final Runnable transactionBoundary;
+  private final TransactionBoundary transactionBoundary;
+
+  /**
+   * Closes the unit of work around a single event.
+   *
+   * <p>A rollback path is required, not optional: when a consumer fails with a database error the
+   * JDBC transaction is left aborted, and every later statement on that connection is rejected with
+   * {@code current transaction is aborted}. Without recovering first, the service cannot even record
+   * why the event failed.</p>
+   */
+  public interface TransactionBoundary {
+    /** Makes the work accumulated so far durable. */
+    void commit();
+
+    /** Discards it and leaves the connection usable again. */
+    void rollback();
+  }
 
   /**
    * Creates a service whose caller owns the transaction: no intermediate commit is issued and the
@@ -67,8 +83,14 @@ public class VectorOutboxService {
    */
   public VectorOutboxService(ConnectionProvider connectionProvider,
       Collection<VectorOutboxConsumer> consumers) {
-    this(connectionProvider, consumers, () -> {
-      // No transaction boundary: the caller commits the whole batch.
+    this(connectionProvider, consumers, new TransactionBoundary() {
+      @Override public void commit() {
+        // No transaction boundary: the caller commits the whole batch.
+      }
+
+      @Override public void rollback() {
+        // Idem: recovering the connection is the caller's responsibility.
+      }
     });
   }
 
@@ -83,7 +105,7 @@ public class VectorOutboxService {
    *     already made.
    */
   public VectorOutboxService(ConnectionProvider connectionProvider,
-      Collection<VectorOutboxConsumer> consumers, Runnable transactionBoundary) {
+      Collection<VectorOutboxConsumer> consumers, TransactionBoundary transactionBoundary) {
     this.connectionProvider = connectionProvider;
     this.consumerResolver = new VectorOutboxConsumerResolver(consumers);
     this.transactionBoundary = transactionBoundary;
@@ -105,15 +127,18 @@ public class VectorOutboxService {
       // The claim has to be durable before the consumer runs: consumers reach external providers,
       // so holding the batch in one transaction would keep PROCESSING invisible to other nodes and
       // would roll back every delivery already made if the run is interrupted.
-      transactionBoundary.run();
+      transactionBoundary.commit();
       try {
         consumer.consume(event);
         markDone(event.getId());
         processed++;
       } catch (Exception e) {
+        // A consumer failing on a database error leaves the transaction aborted, so markFailed
+        // could not write and the event stayed PROCESSING with no trace of the cause.
+        transactionBoundary.rollback();
         markFailed(event.getId(), e);
       }
-      transactionBoundary.run();
+      transactionBoundary.commit();
     }
     return processed;
   }

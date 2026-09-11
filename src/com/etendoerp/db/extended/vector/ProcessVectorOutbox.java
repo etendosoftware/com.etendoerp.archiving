@@ -63,6 +63,14 @@ public class ProcessVectorOutbox extends DalBaseProcess {
     VectorStore store = new VectorStoreService(connectionProvider);
     VectorOutboxConsumer consumer = new DictionaryVectorOutboxConsumer(connectionProvider, store);
     return new VectorOutboxService(connectionProvider, Collections.singletonList(consumer),
-        () -> OBDal.getInstance().commitAndClose());
+        new VectorOutboxService.TransactionBoundary() {
+          @Override public void commit() {
+            OBDal.getInstance().commitAndClose();
+          }
+
+          @Override public void rollback() {
+            OBDal.getInstance().rollbackAndClose();
+          }
+        });
   }
 }
